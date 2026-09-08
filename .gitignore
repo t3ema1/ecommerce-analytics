@@ -1,0 +1,8 @@
+# Data files - too large for git, regenerate from source CSVs instead
+data/
+
+# Python virtual environment - machine-specific, everyone creates their own
+venv/
+
+# Jupyter checkpoint files - auto-generated clutter
+.ipynb_checkpoints/
