@@ -336,6 +336,151 @@ three other tables), 1,291,108 purchasing sessions (matches the order count from
 
 ---
 
+---
+
+## Decision 13: What Power BI loads
+
+**Situation:** the largest fact table is 68,023,553 rows. Loading the detail model into Power BI
+would be slow and unwieldy; pre-aggregating too aggressively would remove any ability to explore.
+
+**Method:** worked through each report page asking what grain it actually requires, then built
+aggregates to match. The question came first, the table second.
+
+| Page | Requires | Table built | Rows |
+|---|---|---|---|
+| Overview — revenue | day, category | `agg_daily_category` | 24,360 |
+| Overview — conversion | day only | `agg_daily_sessions` | 61 |
+| Funnel | day, category, brand | `agg_funnel` | 445,447 |
+| Retention | customer, week | `agg_user_weekly_orders` | 979,709 |
+| Products | product | `agg_product_totals` | 68,079 |
+
+**Key design choices:**
+
+*Sessions kept out of the category-grained table.* A session can touch several categories, so
+session counts are not additive across them. Putting them in `agg_daily_category` would produce a
+session total exceeding the true figure whenever the category filter was removed — silently, with
+no error. Sessions therefore live in a day-only table. The cost is that conversion rate cannot be
+filtered by category on the overview page; that capability exists on the funnel page, which is
+built at the right grain for it.
+
+*Counts stored, not rates.* `agg_funnel` holds `viewed`, `carted` and `carted_and_purchased` as
+counts. Rates cannot be summed or averaged across hierarchy levels; counts can. Power BI therefore
+recomputes the ratio from its components at whatever level is displayed, which makes the
+"conversion correct at every level" requirement work by construction rather than by careful
+measure-writing.
+
+*`carted_and_purchased`, not a plain purchase count.* Q1 established that 33.8% of purchases have
+no cart event in the same session. A cart-to-purchase rate must count only journeys that actually
+passed through the cart. Using a plain purchase count gives 59.33% against the correct 39.30% —
+a figure that nearly inverts the finding.
+
+*`dim_product` filtered to current price.* Price history exists for the Q3 analysis; no BI page
+needs it. Reduces 772,840 rows to 206,876, and makes it a proper one-row-per-product dimension
+rather than something that fans out on join.
+
+*`dim_user` filtered to purchasers.* 5,316,649 down to 697,470. No report page concerns
+browse-only users, and `fact_session` still holds every session including non-purchasing ones if
+that changes.
+
+*High-cardinality columns dropped from `dim_user`.* Four full-precision timestamp columns
+(`first_activity_at`, `last_activity_at`, `first_purchase_at`, `last_purchase_at`) were removed;
+the report uses date granularity only. **File size fell from 120.44 MB to 49.27 MB — a 59%
+reduction from four columns.** Total export fell from 186.80 MB to 115.62 MB.
+
+*CSV rather than Parquet.* Power BI cannot read Parquet without a Power Query workaround. At these
+table sizes Parquet's compression advantage is irrelevant.
+
+**Verification:** every aggregate reconciled against source. Revenue sums to $451,807,232.56
+across `agg_daily_sessions`, `agg_daily_category` and `agg_product_totals`. Funnel counts match Q1
+exactly (68,007,734 viewed / 2,534,696 carted / 996,217 carted-and-purchased), confirming no join
+fan-out in `agg_funnel`.
+
+---
+
+## Decision 14: Redundant key removed from `agg_product_totals`
+
+**Situation:** `agg_product_totals` originally carried `category_id` alongside `product_id`. This
+created two paths from `dim_product` to the table — one direct, one via `dim_category` — and Power
+BI deactivated one to avoid ambiguity, showing it as a dotted relationship.
+
+**Options:** delete the relationship in Power BI, or remove the redundant column at source.
+
+**Decision:** removed the column from the pipeline query.
+
+**Reasoning:** the deactivated relationship is a symptom; the redundant column is the cause.
+Deleting the relationship leaves the column occupying memory, appearing in the field list, and
+ready to recreate the ambiguity if anyone rebuilds the model from these files. A fact table should
+carry only the keys it needs to reach its dimensions — category is reachable through
+`dim_product`.
+
+---
+
+## Decision 15: ABC classification moved from DAX to SQL
+
+**Situation:** ABC classification requires a running cumulative share of revenue across products
+ranked by revenue. Attempted in DAX.
+
+**What failed:** `RANKX` over `ALL(dim_product)` evaluated once per visible row already strained
+the model. Adding a cumulative measure using `FILTER` over `ALL(dim_product)` — which must sum
+revenue across all higher-ranked products, for every row — exceeded available resources outright,
+even after narrowing the ranking population to the 68,079 products that actually sell.
+
+**Decision:** compute the cumulative total and ABC class as a SQL window function in the pipeline,
+and load them as stored columns.
+
+```sql
+SUM(revenue) OVER (ORDER BY revenue DESC) / SUM(revenue) OVER () AS cumulative_pct
+```
+
+One pass in SQL; recalculated per row in DAX.
+
+**Trade-off stated:** the stored column is fixed, so ABC classes do not recalculate under filters,
+while the revenue figures beside them do. For this report that is acceptable — classification is a
+property of the whole period, not of a filtered slice — but it would not be if a user expected
+classes to respond to a date range.
+
+**Broader point:** this is the same trade-off the brief raises for the cohort grid. Building a
+calculation in DAX proves understanding of filter context; production pre-aggregates. Doing one in
+each direction, and being able to say why, demonstrates both.
+
+---
+
+## Decision 16: Funnel shown as cards rather than a funnel visual
+
+**Situation:** the brief asks for a funnel visual. At 68.0M viewed → 2.5M carted → 1.0M purchased,
+96% of the drop occurs at the first step.
+
+**What was tried:** a funnel visual rendered the lower two stages as near-invisible slivers. A
+clustered bar chart was worse — one long bar and two stubs at the axis. A logarithmic scale was
+considered and rejected: it makes magnitudes comparable but misrepresents proportion, and a reader
+could easily misinterpret it as linear.
+
+**Decision:** five cards — the three counts and the two step rates.
+
+**Reasoning:** a chart in which two of three values cannot be read is not doing its job. The cards
+show all five figures legibly. The visual would have looked more impressive and communicated less.
+
+---
+
+## Decision 17: Volume filters on funnel charts
+
+**Situation:** cart abandonment by category and the brand breakdown were both dominated by
+categories and brands with a handful of events, where a single cart produces 0% or 100%
+conversion.
+
+**Decision:** filter the abandonment chart to categories with more than 10,000 carts, and the
+brand table to brands with more than 100,000 views.
+
+**Reasoning:** the same judgement applied in the Python analysis, where category and brand
+breakdowns used a minimum-volume threshold. Extreme percentages from tiny denominators crowd out
+the signal.
+
+**Consequence to disclose:** these filters remove most `unknown_` categories, which are
+individually small but collectively 32% of activity. The filter should be understood as a filter,
+not as an absence. The brand table's total consequently reads 3.75% rather than the unfiltered
+3.73% — a reader taking that figure as the overall rate would be slightly wrong.
+
+
 # Part 2 — Data quality findings
 
 ## `user_session` integrity
@@ -430,6 +575,39 @@ duplicate rows. Fan-out severity depends on *which* rows are affected, not how m
 that the total disagreed with a figure already known.
 
 ---
+
+---
+
+## `ALL(table)` versus `ALL(table[column])` in a ranking measure
+
+Discovered while building the product ranking.
+
+`RANKX(ALL(dim_product[product_id]), ...)` clears the filter on `product_id` only. With `brand`
+also present in the visual, the ranking then happens **within brand** — producing 1, 2, 3, 4, 1,
+5, 2, 6 rather than a clean sequence.
+
+`ALL(dim_product)` clears filters on the entire table, which is what a global ranking requires.
+
+**Why it matters:** the difference is invisible until a second column from the same table appears
+in the visual. Removing `brand` would have hidden the bug without fixing it.
+
+---
+
+## Measures that return the grand total on every row
+
+Discovered when `Items Sold` showed 1,503,806 on every row of a product-grained table.
+
+**Cause:** `Items Sold` sums `agg_daily_category`, which has no relationship to `dim_product`. A
+measure whose source table is unrelated to the grouping field cannot be filtered by it, so every
+row receives the unfiltered total.
+
+**Generalisable signal:** when a measure shows an identical value on every row, it is not being
+filtered — either no relationship exists, or the relationship is not flowing in that direction.
+
+**Consequence:** `Items Sold` and `Product Items Sold` both return 1,503,806 at the grand total
+but respond to different filters. The names were left unchanged to avoid rewiring existing
+visuals; the distinction is documented in the model documentation instead.
+
 
 # Part 3 — Analysis findings
 
@@ -875,6 +1053,55 @@ same three dates without adding information.
 
 ---
 
+## Finding 6: The catalogue is extraordinarily concentrated
+
+| Class | Products | % of selling products | Revenue | % of revenue |
+|---|---|---|---|---|
+| A | 727 | 1.07% | $361,400,540.87 | 80.0% |
+| B | 7,546 | 11.08% | $67,814,047.09 | 15.0% |
+| C | 59,803 | 87.85% | $22,592,644.60 | 5.0% |
+
+**727 products generate 80% of revenue.** The Pareto principle would predict roughly 20% of
+products; this business is about twenty times more concentrated.
+
+Put in fuller context:
+- 206,876 products in the catalogue
+- 68,079 ever sold anything — **67% never sold a single unit in two months**
+- 727 produce 80% of revenue
+
+So **0.35% of the catalogue drives 80% of the business.**
+
+At the very top the concentration is steeper still: one product accounts for 6.5% of all revenue
+($29.5m), and the top three reach 13.5%.
+
+**Consistency check:** Q3 found that 52.7% of products never changed price. Plausibly the same
+products — no sales, no reason to reprice. Not established, but the two figures point the same
+way.
+
+**Method note:** computed as a SQL window function in the pipeline rather than in DAX, after the
+DAX version exceeded available resources (Decision 15).
+
+---
+
+## Finding 7: Cohort retention reproduced independently in DAX
+
+The DAX cohort grid reproduces the Q4 Python analysis exactly, which serves as an independent
+reconciliation of both.
+
+| Cohort | Size | Wk 1 | Wk 2 | Wk 3 |
+|---|---|---|---|---|
+| 2019-09-30 | 78,674 | 20.33% | 17.48% | 13.56% |
+| 2019-10-07 | 85,245 | 16.09% | 11.09% | 8.91% |
+| 2019-10-14 | 81,004 | 13.45% | 9.14% | 9.01% |
+| **2019-11-11** | **146,154** | **7.17%** | **5.26%** | — |
+
+Two independent implementations — one in pandas and DuckDB, one in DAX over a disconnected table —
+producing identical figures is stronger evidence than either alone.
+
+The promotional cohort's weakness is visible immediately: the largest cohort by a factor of two,
+retaining at roughly a third the rate of the first cohort.
+
+
 # Summary of headline numbers
 
 | | |
@@ -884,10 +1111,14 @@ same three dates without adding information.
 | Users | 5,316,649 (13.1% ever purchase) |
 | Sessions | 18,776,366 |
 | Orders | 1,291,108 |
-| Products | 206,876 |
+| Products in catalogue | 206,876 |
+| Products that ever sold | 68,079 (67% never sold) |
 | View → cart | 3.73% |
 | Cart → purchase (same session) | 39.30% |
 | Cart abandonment (same session) | 60.70% |
+| Purchases with no cart event | 33.8% |
 | Repeat purchase rate | 33.4% |
 | Revenue from top 12% of customers | 42% |
+| Products generating 80% of revenue | 727 (0.35% of catalogue) |
 | Promotional incremental revenue | ~$53.7m over 4 days |
+| Promotional cohort week-1 retention | 7.2% (vs 11–20% baseline) |
